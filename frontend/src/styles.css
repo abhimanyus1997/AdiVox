@@ -54,6 +54,8 @@ button { cursor: pointer; }
 .api-setup-copy { display: flex; flex-direction: column; }
 .api-setup-copy strong { font-size: 13px; }
 .api-setup-copy small { margin-top: 3px; color: var(--muted); font-size: 10px; line-height: 1.4; }
+.api-setup-copy a { color: var(--purple-dark); font-weight: 700; text-decoration: underline; text-decoration-color: #b7a8e5; text-underline-offset: 2px; }
+.api-setup-copy a:hover { color: var(--purple); text-decoration-color: currentColor; }
 .api-key-input { height: 40px; display: flex; align-items: center; border: 1px solid #c9c1d8; border-radius: 9px; background: white; }
 .api-key-input input { width: 100%; min-width: 0; padding: 0 10px; border: 0; outline: 0; background: transparent; font-size: 12px; }
 .api-key-input button { width: 36px; display: grid; place-items: center; border: 0; color: var(--muted); background: transparent; }

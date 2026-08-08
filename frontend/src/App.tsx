@@ -418,7 +418,13 @@ function App() {
             {apiConfigured === false && (
               <form className="api-setup" onSubmit={configureApiKey}>
                 <span className="api-setup-icon"><KeyRound size={21} /></span>
-                <div className="api-setup-copy"><strong>Connect Gemini to continue</strong><small>Your key stays in this browser tab's memory and is never saved by AdiVox.</small></div>
+                <div className="api-setup-copy">
+                  <strong>Connect Gemini to continue</strong>
+                  <small>
+                    Your key stays in this browser tab's memory and is never saved by AdiVox.{" "}
+                    <a href="https://aistudio.google.com/api-keys" target="_blank" rel="noreferrer">Get a Gemini API key ↗</a>
+                  </small>
+                </div>
                 <label className="api-key-input">
                   <input
                     aria-label="Gemini API key"
