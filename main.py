@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Annotated
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -38,8 +38,11 @@ ALLOWED_AUDIO_TYPES = {
     "audio/mp4",
     "audio/x-m4a",
 }
-MAX_UPLOAD_BYTES = 200 * 1024 * 1024
-DATABASE_PATH = Path(os.getenv("ADIVOX_DB_PATH", ROOT / "data" / "adivox.db"))
+MAX_UPLOAD_MB = 95 if os.getenv("VERCEL") else 200
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+DEFAULT_DATABASE_PATH = Path("/tmp/adivox.db") if os.getenv("VERCEL") else ROOT / "data" / "adivox.db"
+DATABASE_PATH = Path(os.getenv("ADIVOX_DB_PATH", DEFAULT_DATABASE_PATH))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 
 class TranscriptSegment(BaseModel):
@@ -49,12 +52,32 @@ class TranscriptSegment(BaseModel):
     text: str = Field(min_length=1, description="Verbatim spoken words")
 
 
-class TranscriptResponse(BaseModel):
+class TranscriptContent(BaseModel):
     title: str = Field(description="A short descriptive recording title")
     summary: str = Field(description="A concise 1-3 sentence summary")
     language: str = Field(description="Primary spoken language")
     duration_seconds: float = Field(ge=0, description="Approximate full audio duration")
     segments: list[TranscriptSegment]
+
+
+class TokenUsage(BaseModel):
+    input_tokens: int = 0
+    audio_input_tokens: int = 0
+    text_input_tokens: int = 0
+    output_tokens: int = 0
+    thinking_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: float = 0
+    model: str = "gemini-2.5-flash"
+    pricing_basis: str = "Standard paid tier: $1.00/M audio input, $0.30/M text input, $2.50/M output"
+
+
+class ApiKeyRequest(BaseModel):
+    api_key: str = Field(min_length=10, max_length=256)
+
+
+class TranscriptResponse(TranscriptContent):
+    usage: TokenUsage = Field(default_factory=TokenUsage)
 
 
 class SavedTranscript(TranscriptResponse):
@@ -72,7 +95,12 @@ class SavedTranscriptSummary(BaseModel):
     created_at: str
 
 
-def _database() -> sqlite3.Connection:
+def _database():
+    if DATABASE_URL:
+        from psycopg import connect
+        from psycopg.rows import dict_row
+
+        return connect(DATABASE_URL, row_factory=dict_row)
     connection = sqlite3.connect(DATABASE_PATH, timeout=10)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -80,12 +108,13 @@ def _database() -> sqlite3.Connection:
 
 
 def _init_database() -> None:
-    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not DATABASE_URL:
+        DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _database() as connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS transcripts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_type},
                 title TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 language TEXT NOT NULL,
@@ -94,16 +123,16 @@ def _init_database() -> None:
                 transcript_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
-            """
+            """.format(id_type="BIGSERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT")
         )
-        connection.execute("DROP INDEX IF EXISTS idx_transcripts_created_at")
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_transcripts_created_at_id
             ON transcripts(created_at DESC, id DESC)
             """
         )
-        connection.execute("PRAGMA optimize")
+        if not DATABASE_URL:
+            connection.execute("PRAGMA optimize")
 
 
 _init_database()
@@ -118,14 +147,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+@app.get("/health")
 @app.get("/api/health")
-def health() -> dict[str, str | bool]:
-    return {"status": "ok", "configured": bool(_api_key())}
+@app.get("/adivox/api/health")
+def health() -> dict[str, str | bool | int]:
+    return {
+        "status": "ok",
+        "configured": bool(_api_key()),
+        "max_upload_mb": MAX_UPLOAD_MB,
+        "storage": "postgres" if DATABASE_URL else "sqlite",
+    }
 
 
 def _api_key() -> str | None:
     return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+
+
+@app.post("/configure-key")
+@app.post("/api/configure-key")
+@app.post("/adivox/api/configure-key")
+def configure_api_key(payload: ApiKeyRequest) -> dict[str, str | bool]:
+    candidate = payload.api_key.strip()
+    try:
+        client = genai.Client(api_key=candidate)
+        client.models.get(model="gemini-2.5-flash")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="That Gemini API key could not be validated. Check the key and try again.",
+        ) from exc
+    return {"configured": True, "storage": "browser-memory"}
 
 
 def _normalise_mime(upload: UploadFile) -> str:
@@ -146,7 +197,40 @@ def _normalise_mime(upload: UploadFile) -> str:
     return by_suffix.get(suffix, content_type)
 
 
+def _token_usage(response: object) -> TokenUsage:
+    metadata = getattr(response, "usage_metadata", None)
+    if metadata is None:
+        return TokenUsage()
+
+    input_tokens = int(getattr(metadata, "prompt_token_count", 0) or 0)
+    candidates = int(getattr(metadata, "candidates_token_count", 0) or 0)
+    thinking_tokens = int(getattr(metadata, "thoughts_token_count", 0) or 0)
+    output_tokens = candidates + thinking_tokens
+    total_tokens = int(getattr(metadata, "total_token_count", 0) or 0)
+    audio_input_tokens = 0
+    for detail in getattr(metadata, "prompt_tokens_details", None) or []:
+        if "AUDIO" in str(getattr(detail, "modality", "")).upper():
+            audio_input_tokens += int(getattr(detail, "token_count", 0) or 0)
+    text_input_tokens = max(0, input_tokens - audio_input_tokens)
+    estimated_cost = (
+        audio_input_tokens * 1.00
+        + text_input_tokens * 0.30
+        + output_tokens * 2.50
+    ) / 1_000_000
+    return TokenUsage(
+        input_tokens=input_tokens,
+        audio_input_tokens=audio_input_tokens,
+        text_input_tokens=text_input_tokens,
+        output_tokens=output_tokens,
+        thinking_tokens=thinking_tokens,
+        total_tokens=total_tokens or input_tokens + output_tokens,
+        estimated_cost_usd=round(estimated_cost, 8),
+    )
+
+
+@app.get("/transcripts", response_model=list[SavedTranscriptSummary])
 @app.get("/api/transcripts", response_model=list[SavedTranscriptSummary])
+@app.get("/adivox/api/transcripts", response_model=list[SavedTranscriptSummary])
 def list_transcripts() -> list[SavedTranscriptSummary]:
     with _database() as connection:
         rows = connection.execute(
@@ -160,18 +244,25 @@ def list_transcripts() -> list[SavedTranscriptSummary]:
     return [SavedTranscriptSummary.model_validate(dict(row)) for row in rows]
 
 
+@app.post("/transcripts", response_model=SavedTranscript, status_code=201)
 @app.post("/api/transcripts", response_model=SavedTranscript, status_code=201)
+@app.post("/adivox/api/transcripts", response_model=SavedTranscript, status_code=201)
 def save_transcript(transcript: TranscriptResponse) -> SavedTranscript:
     created_at = datetime.now(timezone.utc).isoformat()
     speaker_count = len({segment.speaker for segment in transcript.segments})
     with _database() as connection:
-        cursor = connection.execute(
-            """
+        query = """
             INSERT INTO transcripts (
                 title, summary, language, duration_seconds, speaker_count,
                 transcript_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
+            ) VALUES ({placeholders})
+            {returning}
+            """.format(
+                placeholders=", ".join(["%s" if DATABASE_URL else "?"] * 7),
+                returning="RETURNING id" if DATABASE_URL else "",
+            )
+        cursor = connection.execute(
+            query,
             (
                 transcript.title,
                 transcript.summary,
@@ -182,15 +273,17 @@ def save_transcript(transcript: TranscriptResponse) -> SavedTranscript:
                 created_at,
             ),
         )
-        transcript_id = cursor.lastrowid
+        transcript_id = cursor.fetchone()["id"] if DATABASE_URL else cursor.lastrowid
     return SavedTranscript(id=transcript_id, created_at=created_at, **transcript.model_dump())
 
 
+@app.get("/transcripts/{transcript_id}", response_model=SavedTranscript)
 @app.get("/api/transcripts/{transcript_id}", response_model=SavedTranscript)
+@app.get("/adivox/api/transcripts/{transcript_id}", response_model=SavedTranscript)
 def get_transcript(transcript_id: int) -> SavedTranscript:
     with _database() as connection:
         row = connection.execute(
-            "SELECT id, transcript_json, created_at FROM transcripts WHERE id = ?",
+            f"SELECT id, transcript_json, created_at FROM transcripts WHERE id = {'%s' if DATABASE_URL else '?'}",
             (transcript_id,),
         ).fetchone()
     if row is None:
@@ -199,15 +292,18 @@ def get_transcript(transcript_id: int) -> SavedTranscript:
     return SavedTranscript(id=row["id"], created_at=row["created_at"], **transcript.model_dump())
 
 
+@app.post("/transcribe", response_model=TranscriptResponse)
 @app.post("/api/transcribe", response_model=TranscriptResponse)
+@app.post("/adivox/api/transcribe", response_model=TranscriptResponse)
 async def transcribe(
     audio: Annotated[UploadFile, File(description="Audio recording to transcribe")],
+    x_gemini_api_key: Annotated[str | None, Header(alias="X-Gemini-API-Key")] = None,
 ) -> TranscriptResponse:
-    api_key = _api_key()
+    api_key = _api_key() or (x_gemini_api_key or "").strip() or None
     if not api_key:
         raise HTTPException(
             status_code=503,
-            detail="Gemini is not configured. Add GEMINI_API_KEY to the project .env file.",
+            detail="Provide a Gemini API key in AdiVox to generate a transcript.",
         )
 
     mime_type = _normalise_mime(audio)
@@ -227,7 +323,7 @@ async def transcribe(
             while chunk := await audio.read(1024 * 1024):
                 total += len(chunk)
                 if total > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="Audio file must be 200 MB or smaller.")
+                    raise HTTPException(status_code=413, detail=f"Audio file must be {MAX_UPLOAD_MB} MB or smaller.")
                 temp.write(chunk)
 
         client = genai.Client(api_key=api_key)
@@ -247,16 +343,18 @@ async def transcribe(
             contents=[prompt, uploaded_file],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=TranscriptResponse,
+                response_schema=TranscriptContent,
                 temperature=0.1,
             ),
         )
         if response.parsed:
-            result = TranscriptResponse.model_validate(response.parsed)
+            content = TranscriptContent.model_validate(response.parsed)
         elif response.text:
-            result = TranscriptResponse.model_validate_json(response.text)
+            content = TranscriptContent.model_validate_json(response.text)
         else:
             raise ValueError("Gemini returned an empty transcript")
+
+        result = TranscriptResponse(**content.model_dump(), usage=_token_usage(response))
 
         result.segments.sort(key=lambda item: item.start_seconds)
         if result.segments:
