@@ -1,0 +1,27 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "frontend": {
+      "root": "frontend/",
+      "framework": "vite"
+    },
+    "backend": {
+      "root": ".",
+      "entrypoint": "main:app",
+      "framework": "fastapi"
+    }
+  },
+  "rewrites": [
+    { "source": "/adivox/api/:path*", "destination": { "service": "backend" } },
+    {
+      "source": "/adivox",
+      "destination": { "service": "frontend", "path": "/index.html" },
+      "transforms": [{ "type": "request.path", "op": "set", "args": "/" }]
+    },
+    {
+      "source": "/adivox/:path*",
+      "destination": { "service": "frontend" },
+      "transforms": [{ "type": "request.path", "op": "set", "args": "/:path*" }]
+    }
+  ]
+}

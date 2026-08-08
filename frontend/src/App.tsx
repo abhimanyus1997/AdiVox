@@ -1,9 +1,14 @@
-import { ChangeEvent, DragEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDownToLine,
+  CircleDollarSign,
   ChevronDown,
   FileAudio,
   FolderOpen,
+  Gauge,
+  Eye,
+  EyeOff,
+  KeyRound,
   Mic,
   Pause,
   Play,
@@ -32,6 +37,17 @@ type Transcript = {
   language: string;
   duration_seconds: number;
   segments: Segment[];
+  usage: {
+    input_tokens: number;
+    audio_input_tokens: number;
+    text_input_tokens: number;
+    output_tokens: number;
+    thinking_tokens: number;
+    total_tokens: number;
+    estimated_cost_usd: number;
+    model: string;
+    pricing_basis: string;
+  };
 };
 
 type SavedTranscriptSummary = {
@@ -46,6 +62,7 @@ type SavedTranscriptSummary = {
 
 const SPEAKER_COLORS = ["#6c4ee3", "#16a673", "#e37839", "#2d85c7", "#d34f82", "#7a8a2b"];
 const PRODUCT_NAME = "AdiVox";
+const API_BASE = import.meta.env.PROD ? "/adivox/api" : "/api";
 
 function formatTime(value: number) {
   if (!Number.isFinite(value)) return "00:00";
@@ -85,6 +102,13 @@ function App() {
   const [savedTranscripts, setSavedTranscripts] = useState<SavedTranscriptSummary[]>([]);
   const [savedId, setSavedId] = useState<number | null>(null);
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved">("idle");
+  const [workspaceTab, setWorkspaceTab] = useState<"transcript" | "usage">("transcript");
+  const [apiConfigured, setApiConfigured] = useState<boolean | null>(null);
+  const [apiKey, setApiKey] = useState("");
+  const [activeApiKey, setActiveApiKey] = useState("");
+  const [maxUploadMb, setMaxUploadMb] = useState(200);
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [configuringKey, setConfiguringKey] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -100,6 +124,7 @@ function App() {
 
   useEffect(() => {
     void refreshSavedTranscripts();
+    void checkConfiguration();
   }, []);
 
   useEffect(() => {
@@ -134,8 +159,8 @@ function App() {
       setError("Choose an MP3, WAV, M4A, AAC, OGG, FLAC, or AIFF audio file.");
       return;
     }
-    if (selected.size > 200 * 1024 * 1024) {
-      setError("That file is over the 200 MB limit.");
+    if (selected.size > maxUploadMb * 1024 * 1024) {
+      setError(`That file is over the ${maxUploadMb} MB limit.`);
       return;
     }
     if (audioUrl) URL.revokeObjectURL(audioUrl);
@@ -226,10 +251,15 @@ function App() {
     const form = new FormData();
     form.append("audio", file);
     try {
-      const response = await fetch("/api/transcribe", { method: "POST", body: form });
+      const response = await fetch(`${API_BASE}/transcribe`, {
+        method: "POST",
+        headers: activeApiKey ? { "X-Gemini-API-Key": activeApiKey } : undefined,
+        body: form,
+      });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "Unable to transcribe this recording.");
       setTranscript(payload);
+      setWorkspaceTab("transcript");
       setSavedId(null);
       setSaveStatus("idle");
     } catch (reason) {
@@ -285,10 +315,46 @@ function App() {
 
   async function refreshSavedTranscripts() {
     try {
-      const response = await fetch("/api/transcripts");
+      const response = await fetch(`${API_BASE}/transcripts`);
       if (response.ok) setSavedTranscripts(await response.json());
     } catch {
       // Saving remains available even if the library cannot be loaded initially.
+    }
+  }
+
+  async function checkConfiguration() {
+    try {
+      const response = await fetch(`${API_BASE}/health`);
+      const payload = await response.json();
+      setApiConfigured(Boolean(payload.configured));
+      if (Number.isFinite(payload.max_upload_mb)) setMaxUploadMb(payload.max_upload_mb);
+    } catch {
+      setApiConfigured(false);
+    }
+  }
+
+  async function configureApiKey(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!apiKey.trim()) return;
+    setConfiguringKey(true);
+    setError("");
+    try {
+      const candidate = apiKey.trim();
+      const response = await fetch(`${API_BASE}/configure-key`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_key: candidate }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "Could not validate this API key.");
+      setActiveApiKey(candidate);
+      setApiConfigured(true);
+      setApiKey("");
+      setShowApiKey(false);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not validate this API key.");
+    } finally {
+      setConfiguringKey(false);
     }
   }
 
@@ -297,7 +363,7 @@ function App() {
     setSaveStatus("saving");
     setError("");
     try {
-      const response = await fetch("/api/transcripts", {
+      const response = await fetch(`${API_BASE}/transcripts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(transcript),
@@ -316,10 +382,11 @@ function App() {
   async function openSavedTranscript(id: number) {
     setError("");
     try {
-      const response = await fetch(`/api/transcripts/${id}`);
+      const response = await fetch(`${API_BASE}/transcripts/${id}`);
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "Could not open this transcript.");
       setTranscript(payload);
+      setWorkspaceTab("transcript");
       setSavedId(id);
       setSaveStatus("saved");
       setFile(null);
@@ -347,6 +414,32 @@ function App() {
             <div className="eyebrow"><Sparkles size={15} /> AI-powered speaker diarization</div>
             <h1>Every voice, <em>made clear.</em></h1>
             <p className="hero-copy">Turn any recording into a precise, speaker-aware transcript in minutes.</p>
+
+            {apiConfigured === false && (
+              <form className="api-setup" onSubmit={configureApiKey}>
+                <span className="api-setup-icon"><KeyRound size={21} /></span>
+                <div className="api-setup-copy">
+                  <strong>Connect Gemini to continue</strong>
+                  <small>
+                    Your key stays in this browser tab's memory and is never saved by AdiVox.{" "}
+                    <a href="https://aistudio.google.com/api-keys" target="_blank" rel="noreferrer">Get a Gemini API key ↗</a>
+                  </small>
+                </div>
+                <label className="api-key-input">
+                  <input
+                    aria-label="Gemini API key"
+                    type={showApiKey ? "text" : "password"}
+                    value={apiKey}
+                    onChange={(event) => setApiKey(event.target.value)}
+                    placeholder="Paste Gemini API key"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <button type="button" aria-label={showApiKey ? "Hide API key" : "Show API key"} onClick={() => setShowApiKey((value) => !value)}>{showApiKey ? <EyeOff size={17} /> : <Eye size={17} />}</button>
+                </label>
+                <button className="connect-key-button" disabled={configuringKey || apiKey.trim().length < 10}>{configuringKey ? "Checking…" : "Connect"}</button>
+              </form>
+            )}
 
             <div className="input-tabs" role="tablist" aria-label="Audio source">
               <button role="tab" aria-selected={inputMode === "upload"} className={inputMode === "upload" ? "active" : ""} onClick={() => setInputMode("upload")}><UploadCloud size={16} /> Upload file</button>
@@ -391,7 +484,7 @@ function App() {
                   <h2>Drop your recording here</h2>
                   <p>or choose a file from your computer</p>
                   <button className="primary-button" onClick={() => inputRef.current?.click()}>Choose audio</button>
-                  <small>MP3, WAV, M4A, AAC, OGG, FLAC or AIFF · up to 200 MB</small>
+                  <small>MP3, WAV, M4A, AAC, OGG, FLAC or AIFF · up to {maxUploadMb} MB</small>
                 </>
               ) : (
                 <div className="selected-file">
@@ -403,7 +496,7 @@ function App() {
               <input ref={inputRef} hidden type="file" accept="audio/*,.m4a,.aiff" onChange={(event) => chooseFile(event.target.files?.[0])} />
             </div>
 
-            {file && recordingState === "idle" && <button className="generate-button" disabled={loading} onClick={generateTranscript}>
+            {file && recordingState === "idle" && <button className="generate-button" disabled={loading || apiConfigured === false} onClick={generateTranscript}>
               {loading ? <><span className="spinner" /> Listening and identifying speakers…</> : <><Sparkles size={18} /> Generate transcript</>}
             </button>}
             {error && <div className="error-message" role="alert">{error}</div>}
@@ -411,7 +504,7 @@ function App() {
             {savedTranscripts.length > 0 && (
               <section className="saved-library" aria-labelledby="saved-heading">
                 <div className="saved-library-heading">
-                  <div><span>Local library</span><h2 id="saved-heading">Saved transcripts</h2></div>
+                  <div><span>Transcript library</span><h2 id="saved-heading">Saved transcripts</h2></div>
                   <small>{savedTranscripts.length} saved</small>
                 </div>
                 <div className="saved-grid">
@@ -442,7 +535,7 @@ function App() {
               </div>
               <div className="workspace-actions">
               <button className={`save-button ${saveStatus === "saved" ? "saved" : ""}`} disabled={saveStatus !== "idle"} onClick={saveCurrentTranscript}>
-                <Save size={17} /> {saveStatus === "saving" ? "Saving…" : saveStatus === "saved" ? "Saved locally" : "Save transcript"}
+                <Save size={17} /> {saveStatus === "saving" ? "Saving…" : saveStatus === "saved" ? "Saved" : "Save transcript"}
               </button>
               <label className="export-button">
                 <ArrowDownToLine size={17} />
@@ -465,6 +558,12 @@ function App() {
               </div>
             </div>
 
+            <div className="workspace-tabs" role="tablist" aria-label="Transcript details">
+              <button role="tab" aria-selected={workspaceTab === "transcript"} className={workspaceTab === "transcript" ? "active" : ""} onClick={() => setWorkspaceTab("transcript")}>Transcript</button>
+              <button role="tab" aria-selected={workspaceTab === "usage"} className={workspaceTab === "usage" ? "active" : ""} onClick={() => setWorkspaceTab("usage")}><Gauge size={16} /> Usage & cost</button>
+            </div>
+
+            {workspaceTab === "transcript" ? <>
             <div className="recording-card">
               <div className="player-toolbar">
                 <div className="transport">
@@ -521,6 +620,28 @@ function App() {
               })}
               {visibleSegments?.length === 0 && <div className="empty-search">No transcript lines match “{query}”.</div>}
             </div>
+            </> : (
+              <section className="usage-panel">
+                <div className="usage-hero">
+                  <span><CircleDollarSign size={22} /></span>
+                  <div><small>Estimated standard-tier cost</small><strong>${transcript.usage.estimated_cost_usd.toFixed(6)}</strong></div>
+                  <p>This is an estimate based on reported Gemini token usage. Free-tier requests may cost $0.</p>
+                </div>
+                <div className="usage-grid">
+                  <article><span>All tokens</span><strong>{transcript.usage.total_tokens.toLocaleString()}</strong><small>Input + output</small></article>
+                  <article><span>Input tokens</span><strong>{transcript.usage.input_tokens.toLocaleString()}</strong><small>{transcript.usage.audio_input_tokens.toLocaleString()} audio · {transcript.usage.text_input_tokens.toLocaleString()} text</small></article>
+                  <article><span>Output tokens</span><strong>{transcript.usage.output_tokens.toLocaleString()}</strong><small>Includes {transcript.usage.thinking_tokens.toLocaleString()} thinking</small></article>
+                  <article><span>Audio utilization</span><strong>{transcript.usage.input_tokens ? Math.round((transcript.usage.audio_input_tokens / transcript.usage.input_tokens) * 100) : 0}%</strong><small>Share of input tokens</small></article>
+                </div>
+                <div className="cost-breakdown">
+                  <div><span>Audio input</span><b>{transcript.usage.audio_input_tokens.toLocaleString()} × $1.00 / 1M</b></div>
+                  <div><span>Text input</span><b>{transcript.usage.text_input_tokens.toLocaleString()} × $0.30 / 1M</b></div>
+                  <div><span>Model output</span><b>{transcript.usage.output_tokens.toLocaleString()} × $2.50 / 1M</b></div>
+                  <footer><span>Model</span><b>{transcript.usage.model}</b></footer>
+                </div>
+                <p className="pricing-note">{transcript.usage.pricing_basis}. Pricing can change; this estimate excludes free-tier allowances, caching, taxes, and other services.</p>
+              </section>
+            )}
           </section>
         )}
         <audio
